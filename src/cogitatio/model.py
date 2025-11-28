@@ -242,7 +242,7 @@ class MuThought(nn.Module):
             value: (batch,)
         """
         # Pool over sequence
-        pooled = state.mean(dim=1)  # (batch, d_model)
+        pooled = state[:,-1,:] # (batch, d_model)
         pooled = self.norm(pooled)
         
         # Policy and value
@@ -258,7 +258,10 @@ class MuThought(nn.Module):
         step: int,
     ) -> torch.Tensor:
         """
-        Apply selected thought blocks to state.
+        Apply selected thought blocks to state (efficient parallel version).
+        Works on CUDA, MPS, and CPU.
+        
+        Only computes blocks that are actually needed, but runs them in parallel.
         
         Args:
             state: (batch, seq_len, d_model)
@@ -271,25 +274,48 @@ class MuThought(nn.Module):
         batch_size = state.shape[0]
         device = state.device
         
-        # Add step embedding
+        # Handle STOP actions (no-op)
+        stop_mask = (block_idx >= self.n_blocks)
+        new_state = state.clone()
+        
+        if stop_mask.all():
+            return new_state
+        
+        # Add step embedding (same for all)
         step_emb = self.step_emb(torch.tensor(step, device=device))
+        state_with_step = state + step_emb
         
-        # Process each sample (blocks may differ per sample)
-        new_states = []
-        for i in range(batch_size):
-            idx = block_idx[i].item()
-            if idx < self.n_blocks:  # Not STOP
-                # Add step and block embeddings
-                block_emb = self.block_emb(torch.tensor(idx, device=device))
-                s = state[i] + step_emb + block_emb
-                # Apply block
-                s = self.thought_blocks[idx](s.unsqueeze(0)).squeeze(0)
-                new_states.append(s)
-            else:
-                # STOP action - state unchanged
-                new_states.append(state[i])
+        # Group samples by which block they need
+        block_outputs = {}
+        sample_indices = {}
         
-        return torch.stack(new_states, dim=0)
+        for block_id in range(self.n_blocks):
+            # Find samples that need this block
+            mask = (block_idx == block_id)
+            if not mask.any():
+                continue
+            
+            # Get the samples and their original indices
+            group_state = state_with_step[mask]
+            group_indices = torch.where(mask)[0]
+            
+            # Add block-specific embedding
+            block_emb = self.block_emb(torch.tensor(block_id, device=device))
+            group_state = group_state + block_emb
+            
+            # Apply block to this group (batched, so efficient)
+            transformed = self.thought_blocks[block_id](group_state)
+            
+            # Store results with original indices
+            block_outputs[block_id] = transformed
+            sample_indices[block_id] = group_indices
+        
+        # Write results back to output tensor
+        for block_id, output in block_outputs.items():
+            indices = sample_indices[block_id]
+            new_state[indices] = output
+        
+        return new_state
     
     def forward(
         self, 
