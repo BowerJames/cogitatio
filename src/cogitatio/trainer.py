@@ -25,7 +25,7 @@ from .model import MuThought, ThoughtOutput
 class TrainConfig:
     """Training configuration."""
     # Learning rates
-    lr_model: float = 1e-3      # LR for embeddings, blocks, decoder
+    lr_model: float = 1e-3      # LR for embeddings, layers, decoder
     lr_policy: float = 3e-3     # LR for policy/value heads (faster)
     
     # RL hyperparameters
@@ -68,8 +68,8 @@ class Metrics:
     avg_steps_global: float = 0.0
     avg_steps_second_min: float = 0.0
     
-    # Block usage (will be populated)
-    block_usage: Dict[int, float] = field(default_factory=dict)
+    # Layer usage (will be populated)
+    layer_usage: Dict[int, float] = field(default_factory=dict)
     
     # Counts for averaging
     n_samples: int = 0
@@ -112,12 +112,12 @@ class MuThoughtTrainer:
         self.model = self.model.to(self.device)
         
         # Create parameter groups with different learning rates
-        # Slow: embeddings, thought blocks, decoder, norm
+        # Slow: embeddings, latent layers, decoder, norm
         slow_params = list(model.token_emb.parameters()) + \
                       list(model.pos_emb.parameters()) + \
                       list(model.step_emb.parameters()) + \
                       list(model.block_emb.parameters()) + \
-                      list(model.thought_blocks.parameters()) + \
+                      list(model.latent_layers.parameters()) + \
                       list(model.decoder.parameters()) + \
                       list(model.norm.parameters())
         
@@ -209,11 +209,11 @@ class MuThoughtTrainer:
         global_mask = (modes == 1)
         second_min_mask = (modes == 2)
         
-        # Block usage statistics
-        block_counts = {}
+        # Layer usage statistics
+        layer_counts = {}
         for b in range(self.model.n_blocks + 1):  # Include STOP
             count = (output.actions == b).float().sum().item()
-            block_counts[b] = count
+            layer_counts[b] = count
         
         metrics = {
             "ce_loss_base": ce_loss_base.mean().item(),
@@ -237,7 +237,7 @@ class MuThoughtTrainer:
             "avg_steps_global": output.num_steps[global_mask].float().mean().item() if global_mask.any() else 0.0,
             "avg_steps_second_min": output.num_steps[second_min_mask].float().mean().item() if second_min_mask.any() else 0.0,
             
-            "block_usage": block_counts,
+            "layer_usage": layer_counts,
             "n_local": local_mask.sum().item(),
             "n_global": global_mask.sum().item(),
             "n_second_min": second_min_mask.sum().item(),
@@ -254,7 +254,7 @@ class MuThoughtTrainer:
         self.model.train()
         
         metrics = Metrics()
-        block_usage_total = {i: 0.0 for i in range(self.model.n_blocks + 1)}
+        layer_usage_total = {i: 0.0 for i in range(self.model.n_blocks + 1)}
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
         for batch in pbar:
@@ -309,8 +309,8 @@ class MuThoughtTrainer:
             metrics.avg_steps_global += batch_metrics["avg_steps_global"] * batch_metrics["n_global"]
             metrics.avg_steps_second_min += batch_metrics["avg_steps_second_min"] * batch_metrics["n_second_min"]
             
-            for k, v in batch_metrics["block_usage"].items():
-                block_usage_total[k] += v
+            for k, v in batch_metrics["layer_usage"].items():
+                layer_usage_total[k] += v
             
             # Update progress bar
             pbar.set_postfix({
@@ -346,11 +346,11 @@ class MuThoughtTrainer:
         metrics.avg_steps_global /= n_global
         metrics.avg_steps_second_min /= n_second_min
         
-        # Normalize block usage
-        total_actions = sum(block_usage_total.values())
-        metrics.block_usage = {
+        # Normalize layer usage
+        total_actions = sum(layer_usage_total.values())
+        metrics.layer_usage = {
             k: v / total_actions if total_actions > 0 else 0.0
-            for k, v in block_usage_total.items()
+            for k, v in layer_usage_total.items()
         }
         
         return metrics
@@ -364,7 +364,7 @@ class MuThoughtTrainer:
         self.model.eval()
         
         metrics = Metrics()
-        block_usage_total = {i: 0.0 for i in range(self.model.n_blocks + 1)}
+        layer_usage_total = {i: 0.0 for i in range(self.model.n_blocks + 1)}
         
         for batch in data_loader:
             x = batch["x"].to(self.device)
@@ -401,8 +401,8 @@ class MuThoughtTrainer:
             metrics.avg_steps_global += batch_metrics["avg_steps_global"] * batch_metrics["n_global"]
             metrics.avg_steps_second_min += batch_metrics["avg_steps_second_min"] * batch_metrics["n_second_min"]
             
-            for k, v in batch_metrics["block_usage"].items():
-                block_usage_total[k] += v
+            for k, v in batch_metrics["layer_usage"].items():
+                layer_usage_total[k] += v
         
         # Average metrics
         n = metrics.n_samples
@@ -427,11 +427,11 @@ class MuThoughtTrainer:
         metrics.avg_steps_global /= n_global
         metrics.avg_steps_second_min /= n_second_min
         
-        # Normalize block usage
-        total_actions = sum(block_usage_total.values())
-        metrics.block_usage = {
+        # Normalize layer usage
+        total_actions = sum(layer_usage_total.values())
+        metrics.layer_usage = {
             k: v / total_actions if total_actions > 0 else 0.0
-            for k, v in block_usage_total.items()
+            for k, v in layer_usage_total.items()
         }
         
         return metrics
@@ -478,11 +478,11 @@ class MuThoughtTrainer:
                 print(f"  SecondMin - Acc: {val_metrics.acc_second_min_final:.4f}, "
                       f"Steps: {val_metrics.avg_steps_second_min:.2f}")
             
-            # Block usage
-            print(f"  Block usage: ", end="")
+            # Layer usage
+            print(f"  Layer usage: ", end="")
             for i in range(self.model.n_blocks):
-                print(f"B{i}: {val_metrics.block_usage.get(i, 0):.1%} ", end="")
-            print(f"STOP: {val_metrics.block_usage.get(self.model.stop_action, 0):.1%}")
+                print(f"L{i}: {val_metrics.layer_usage.get(i, 0):.1%} ", end="")
+            print(f"STOP: {val_metrics.layer_usage.get(self.model.stop_action, 0):.1%}")
             print()
             
             history.append({

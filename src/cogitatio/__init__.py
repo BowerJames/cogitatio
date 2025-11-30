@@ -2,13 +2,13 @@
 Cogitatio: MuThought Level 2 Implementation
 
 A novel architecture for adaptive computation in language models using
-RL-based routing over a pool of thought blocks.
+RL-based routing over a pool of latent layers.
 
 Architecture:
-- Encoder: Embeds input tokens into "thought space"
-- Thought Pool: N residual blocks that can be applied in any order
-- Policy/Value Heads: Actor-critic heads that decide which block to apply
-- Decoder: Maps final thought state to output logits
+- Encoder: Embeds input tokens into "latent space"
+- Latent Pool: N residual layers that can be applied in any order
+- Policy/Value Heads: Actor-critic heads that decide which layer to apply
+- Decoder: Maps final latent state to output logits
 
 Usage:
     from cogitatio import MuThought, ToySequenceDataset, MuThoughtTrainer
@@ -33,7 +33,7 @@ from .dataset import (
 )
 from .model import (
     MuThought,
-    ThoughtBlock,
+    LatentLayer,
     ThoughtOutput,
     # Comparison models
     BaselineModel,
@@ -57,7 +57,7 @@ __all__ = [
     "VOCAB_SIZE",
     # Model
     "MuThought",
-    "ThoughtBlock",
+    "LatentLayer",
     "ThoughtOutput",
     # Comparison models
     "BaselineModel",

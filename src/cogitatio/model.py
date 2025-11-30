@@ -30,9 +30,9 @@ class ThoughtOutput(NamedTuple):
     entropies: torch.Tensor        # (batch, max_steps) - entropy at each step
 
 
-class ThoughtBlock(nn.Module):
+class LatentLayer(nn.Module):
     """
-    A single thought block (residual transformer layer).
+    A single latent layer (residual transformer layer).
     
     This wraps a transformer encoder layer and adds:
     - Pre-norm for stability
@@ -67,7 +67,7 @@ class ThoughtBlock(nn.Module):
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Apply thought block.
+        Apply latent layer.
         
         Args:
             x: (batch, seq_len, d_model)
@@ -91,16 +91,16 @@ class MuThought(nn.Module):
     MuThought Level 2: Adaptive computation via RL routing.
     
     Architecture:
-    - Token + positional embeddings → initial thought state s_0
-    - Thought loop:
-        - Policy head chooses: apply block_i or STOP
-        - If block chosen: s_{t+1} = block_i(s_t + step_emb + block_emb)
+    - Token + positional embeddings → initial latent state s_0
+    - Latent loop:
+        - Policy head chooses: apply layer_i or STOP
+        - If layer chosen: s_{t+1} = layer_i(s_t + step_emb + layer_emb)
         - If STOP: exit loop
     - Decoder head: final state → logits
     
     Training:
     - Zero-thought baseline: decode s_0 directly
-    - Thinking path: decode final state after thought loop
+    - Thinking path: decode final state after latent loop
     - Reward: improvement in cross-entropy minus step penalty
     """
     
@@ -119,7 +119,7 @@ class MuThought(nn.Module):
         Args:
             vocab_size: Size of vocabulary
             d_model: Hidden dimension
-            n_blocks: Number of thought blocks in the pool
+            n_blocks: Number of latent layers in the pool
             n_heads: Number of attention heads per block
             max_steps: Maximum thinking steps allowed
             max_seq_len: Maximum sequence length
@@ -147,9 +147,9 @@ class MuThought(nn.Module):
         # Block ID embedding: tells the block "which block am I"
         self.block_emb = nn.Embedding(n_blocks, d_model)
         
-        # Thought pool: N residual blocks
-        self.thought_blocks = nn.ModuleList([
-            ThoughtBlock(d_model, n_heads, dropout=dropout)
+        # Latent pool: N residual layers
+        self.latent_layers = nn.ModuleList([
+            LatentLayer(d_model, n_heads, dropout=dropout)
             for _ in range(n_blocks)
         ])
         
@@ -251,21 +251,21 @@ class MuThought(nn.Module):
         
         return policy_logits, value
     
-    def apply_block(
+    def apply_layer(
         self, 
         state: torch.Tensor, 
-        block_idx: torch.Tensor,
+        layer_idx: torch.Tensor,
         step: int,
     ) -> torch.Tensor:
         """
-        Apply selected thought blocks to state (efficient parallel version).
+        Apply selected latent layers to state (efficient parallel version).
         Works on CUDA, MPS, and CPU.
         
-        Only computes blocks that are actually needed, but runs them in parallel.
+        Only computes layers that are actually needed, but runs them in parallel.
         
         Args:
             state: (batch, seq_len, d_model)
-            block_idx: (batch,) indices of blocks to apply
+            layer_idx: (batch,) indices of layers to apply
             step: Current thinking step (for step embedding)
             
         Returns:
@@ -275,7 +275,7 @@ class MuThought(nn.Module):
         device = state.device
         
         # Handle STOP actions (no-op)
-        stop_mask = (block_idx >= self.n_blocks)
+        stop_mask = (layer_idx >= self.n_blocks)
         new_state = state.clone()
         
         if stop_mask.all():
@@ -285,13 +285,13 @@ class MuThought(nn.Module):
         step_emb = self.step_emb(torch.tensor(step, device=device))
         state_with_step = state + step_emb
         
-        # Group samples by which block they need
-        block_outputs = {}
+        # Group samples by which layer they need
+        layer_outputs = {}
         sample_indices = {}
         
-        for block_id in range(self.n_blocks):
-            # Find samples that need this block
-            mask = (block_idx == block_id)
+        for layer_id in range(self.n_blocks):
+            # Find samples that need this layer
+            mask = (layer_idx == layer_id)
             if not mask.any():
                 continue
             
@@ -299,20 +299,20 @@ class MuThought(nn.Module):
             group_state = state_with_step[mask]
             group_indices = torch.where(mask)[0]
             
-            # Add block-specific embedding
-            block_emb = self.block_emb(torch.tensor(block_id, device=device))
-            group_state = group_state + block_emb
+            # Add layer-specific embedding (reusing block_emb for now as layer_emb)
+            layer_emb = self.block_emb(torch.tensor(layer_id, device=device))
+            group_state = group_state + layer_emb
             
-            # Apply block to this group (batched, so efficient)
-            transformed = self.thought_blocks[block_id](group_state)
+            # Apply layer to this group (batched, so efficient)
+            transformed = self.latent_layers[layer_id](group_state)
             
             # Store results with original indices
-            block_outputs[block_id] = transformed
-            sample_indices[block_id] = group_indices
+            layer_outputs[layer_id] = transformed
+            sample_indices[layer_id] = group_indices
         
         # Write results back to output tensor
-        for block_id, output in block_outputs.items():
-            indices = sample_indices[block_id]
+        for layer_id, output in layer_outputs.items():
+            indices = sample_indices[layer_id]
             new_state[indices] = output
         
         return new_state
@@ -390,8 +390,8 @@ class MuThought(nn.Module):
                     entropies_list.append(torch.zeros(batch_size, device=device))
                 break
             
-            # Apply blocks for active samples (with STOP meaning no-op)
-            state = self.apply_block(state, action, step)
+            # Apply layers for active samples (with STOP meaning no-op)
+            state = self.apply_layer(state, action, step)
         
         # Final decode
         logits_final = self.decode(state)
@@ -421,8 +421,8 @@ class MuThought(nn.Module):
                 self.step_emb.weight,
                 self.block_emb.weight,
             ]),
-            "thought_blocks": sum(
-                p.numel() for block in self.thought_blocks for p in block.parameters()
+            "latent_layers": sum(
+                p.numel() for layer in self.latent_layers for p in layer.parameters()
             ),
             "policy_head": sum(p.numel() for p in self.policy_head.parameters()),
             "value_head": sum(p.numel() for p in self.value_head.parameters()),
@@ -552,7 +552,7 @@ class TraditionalModel(nn.Module):
         
         # Fixed stack of residual layers
         self.layers = nn.ModuleList([
-            ThoughtBlock(d_model, n_heads, dropout=dropout)
+            LatentLayer(d_model, n_heads, dropout=dropout)
             for _ in range(n_layers)
         ])
         
@@ -653,9 +653,9 @@ class RandomOrderModel(nn.Module):
         # Block ID embedding
         self.block_emb = nn.Embedding(n_blocks, d_model)
         
-        # Pool of blocks (same as MuThought)
-        self.blocks = nn.ModuleList([
-            ThoughtBlock(d_model, n_heads, dropout=dropout)
+        # Pool of layers (same as MuThought)
+        self.layers = nn.ModuleList([
+            LatentLayer(d_model, n_heads, dropout=dropout)
             for _ in range(n_blocks)
         ])
         
@@ -702,15 +702,15 @@ class RandomOrderModel(nn.Module):
             # Use fixed order during evaluation for reproducibility
             order = torch.arange(self.n_blocks, device=device)
         
-        # Apply all blocks in random order
-        for step, block_idx in enumerate(order):
-            # Add step and block embeddings (like MuThought)
+        # Apply all layers in random order
+        for step, layer_idx in enumerate(order):
+            # Add step and layer embeddings (like MuThought)
             step_emb = self.step_emb(torch.tensor(step, device=device))
-            block_emb = self.block_emb(block_idx)
-            state = state + step_emb + block_emb
+            layer_emb = self.block_emb(layer_idx)
+            state = state + step_emb + layer_emb
             
-            # Apply block
-            state = self.blocks[block_idx](state)
+            # Apply layer
+            state = self.layers[layer_idx](state)
         
         # Pool based on mode
         if self.pool_mode == "mean":
@@ -729,7 +729,7 @@ class RandomOrderModel(nn.Module):
                 self.step_emb.weight,
                 self.block_emb.weight,
             ]),
-            "blocks": sum(p.numel() for block in self.blocks for p in block.parameters()),
+            "layers": sum(p.numel() for layer in self.layers for p in layer.parameters()),
             "decoder": sum(p.numel() for p in self.decoder.parameters()),
             "norm": sum(p.numel() for p in self.norm.parameters()),
         }
