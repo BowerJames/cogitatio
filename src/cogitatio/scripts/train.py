@@ -52,7 +52,7 @@ def parse_args():
     parser.add_argument("--n_heads", type=int, default=4, help="Number of attention heads (ignored for baseline)")
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate")
     parser.add_argument(
-        "--pool_mode", type=str, default="mean", choices=["mean", "last"],
+        "--pool_mode", type=str, default="last", choices=["mean", "last"],
         help="Pooling mode before decoder"
     )
     
